@@ -2,7 +2,7 @@ import { LogEntry, LogStream } from './log.ts';
 import { NormalizedLogEntry } from './entry.ts';
 import { Repository, MemRepoStorage } from '../repo/repo.ts';
 import { Item } from '../cfds/base/item.ts';
-import { Scheme } from '../cfds/base/scheme.ts';
+import { Schema } from '../cfds/base/schema.ts';
 
 export class RepoLogStream implements LogStream {
   constructor(readonly repositories: Repository<MemRepoStorage>[]) {}
@@ -24,7 +24,7 @@ export class RepoLogStream implements LogStream {
     min.setValueForKey(
       e.logId,
       new Item({
-        scheme: Scheme.event(),
+        schema: Scheme.event(),
         data: {
           json: JSON.stringify(e),
         },

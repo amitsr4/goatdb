@@ -20,15 +20,18 @@ import { HTTPMethod } from '../../logging/metrics.ts';
 import { Endpoint, ServerServices } from './server.ts';
 import { getBaseURL, getRequestPath } from './utils.ts';
 // import { ResetPasswordEmail } from '../../emails/reset-password.tsx';
-import { Scheme } from '../../cfds/base/scheme.ts';
+import { kSchemaUser, Schema, SchemaTypeUser } from '../../cfds/base/schema.ts';
 import { normalizeEmail } from '../../base/string.ts';
 import { ReadonlyJSONObject } from '../../base/interfaces.ts';
 import { accessDenied } from '../../cfds/base/errors.ts';
 import { copyToClipboard } from '../../base/development.ts';
 import { MemRepoStorage, Repository } from '../../repo/repo.ts';
-import { SysDirIndexes } from './sync.ts';
 import { sleep } from '../../base/time.ts';
 import { isDevelopmentBuild } from '../../base/development.ts';
+import { GoatDB } from '../../db/db.ts';
+import { coreValueCompare } from '../../base/core-types/comparable.ts';
+import { bsearch, bsearch_idx } from '../../base/algorithms.ts';
+import { itemPathGetPart, ItemPathPart } from '../../db/path.ts';
 
 export const kAuthEndpointPaths = [
   '/auth/session',
@@ -104,9 +107,6 @@ export class AuthEndpoint implements Endpoint {
     services: ServerServices,
     req: Request,
   ): Promise<Response> {
-    if (!services.sync.ready) {
-      return Promise.resolve(new Response(null, { status: 503 }));
-    }
     let publicKey: CryptoKey | undefined;
     try {
       const body = await req.json();
@@ -142,7 +142,7 @@ export class AuthEndpoint implements Endpoint {
     const resp = new Response(
       JSON.stringify({
         session: encodedSession,
-        roots: fetchEncodedRootSessions(services.sync.getSysDir()),
+        roots: await fetchEncodedRootSessions(services.db),
       }),
     );
     resp.headers.set('Content-Type', 'application/json');
@@ -153,7 +153,7 @@ export class AuthEndpoint implements Endpoint {
     services: ServerServices,
     req: Request,
   ): Promise<Response> {
-    const smtp = services.email;
+    // const smtp = services.email;
     const body = await req.json();
     const email = normalizeEmail(body.email);
     if (typeof email !== 'string') {
@@ -170,7 +170,10 @@ export class AuthEndpoint implements Endpoint {
       return responseForError('AccessDenied');
     }
 
-    const requestingSession = fetchSessionById(services, requestingSessionId);
+    const requestingSession = await fetchSessionById(
+      services,
+      requestingSessionId,
+    );
     if (!requestingSession) {
       return responseForError('AccessDenied');
     }
@@ -185,11 +188,14 @@ export class AuthEndpoint implements Endpoint {
       return responseForError('AccessDenied');
     }
 
-    const [userKey, userRecord] = fetchUserByEmail(services, email);
+    const { key: userKey, item: userItem } = await fetchUserByEmail(
+      services,
+      email,
+    );
     // TODO (ofri): Rate limit this call
 
-    // We unconditionally generate the signed token so this call isn't
-    // vulnerable to timing attacks.
+    // Unconditionally generate the signed token so this call isn't vulnerable
+    // to timing attacks.
     const signedToken = await signData(services.settings.session, undefined, {
       u: userKey || '',
       s: requestingSessionId,
@@ -205,20 +211,20 @@ export class AuthEndpoint implements Endpoint {
     }
     // Only send the mail if a user really exists. We send the email
     // asynchronously both for speed and to avoid timing attacks.
-    if (userRecord !== undefined) {
-      smtp.send({
-        type: 'Login',
-        to: email,
-        subject: 'Login to Ovvio',
-        plaintext: `Click on this link to login to Ovvio: ${clickURL}`,
-        // html: ResetPasswordEmail({
-        //   clickURL,
-        //   baseUrl: getBaseURL(services),
-        //   username: userRecord.get('name') || 'Anonymous',
-        //   orgname: services.organizationId,
-        // }),
-        html: `<html><body><div>Click on this link to login to Ovvio: <a href="${clickURL}">here</a></body></html>`,
-      });
+    if (userItem !== undefined) {
+      // smtp.send({
+      //   type: 'Login',
+      //   to: email,
+      //   subject: 'Login to Ovvio',
+      //   plaintext: `Click on this link to login to Ovvio: ${clickURL}`,
+      //   // html: ResetPasswordEmail({
+      //   //   clickURL,
+      //   //   baseUrl: getBaseURL(services),
+      //   //   username: userRecord.get('name') || 'Anonymous',
+      //   //   orgname: services.organizationId,
+      //   // }),
+      //   html: `<html><body><div>Click on this link to login to Ovvio: <a href="${clickURL}">here</a></body></html>`,
+      // });
     }
     return new Response('OK', { status: 200 });
   }
@@ -237,7 +243,7 @@ export class AuthEndpoint implements Endpoint {
       if (!signerId) {
         return this.redirectHome(services);
       }
-      const signerSession = fetchSessionById(services, signerId);
+      const signerSession = await fetchSessionById(services, signerId);
       if (
         !signerSession ||
         signerSession.owner !== 'root' || // Only root may sign login tokens
@@ -246,12 +252,15 @@ export class AuthEndpoint implements Endpoint {
         return this.redirectHome(services);
       }
       const userKey = signature.data.u;
-      const repo = services.sync.getSysDir();
-      const userRecord = repo.valueForKey(userKey);
-      if (!userRecord || userRecord.isNull) {
+      const usersRepo = await services.db.open('/sys/users');
+      const user = usersRepo.valueForKey(userKey);
+      if (!user || user[0].isNull) {
         return this.redirectHome(services);
       }
-      const session = fetchSessionById(services, signature.data.s);
+      const sessionsRepo = await services.db.open('/sys/sessions');
+      const session = (await services.db.getTrustPool()).getSession(
+        signature.data.s,
+      );
       if (!session) {
         return this.redirectHome(services);
       }
@@ -259,10 +268,10 @@ export class AuthEndpoint implements Endpoint {
         return this.redirectHome(services);
       }
       session.owner = userKey;
-      repo.setValueForKey(
+      sessionsRepo.setValueForKey(
         session.id,
         await sessionToRecord(session),
-        repo.headForKey(session.id),
+        sessionsRepo.headForKey(session.id),
       );
       // Let the updated session time to replicate
       if (!isDevelopmentBuild()) {
@@ -290,80 +299,81 @@ export async function persistSession(
   services: ServerServices,
   session: Session | OwnedSession,
 ): Promise<void> {
-  const repo = services.sync.getSysDir();
+  const repo = await services.db.open('/sys/sessions');
   const record = await sessionToRecord(session);
   await repo.setValueForKey(session.id, record, undefined);
+  await services.db.flush('/sys/sessions');
 }
 
-export function fetchEncodedRootSessions(
-  sysDir: Repository<MemRepoStorage, SysDirIndexes>,
-): EncodedSession[] {
+export async function fetchEncodedRootSessions(
+  db: GoatDB,
+): Promise<EncodedSession[]> {
   const result: EncodedSession[] = [];
-  const rootSessions = sysDir.indexes!.rootSessions;
-  for (const [_key, record] of rootSessions.values()) {
-    if (record.get<Date>('expiration').getTime() - Date.now() <= 0) {
+  const trustPool = await db.getTrustPool();
+  const now = new Date();
+  for (const session of trustPool.roots) {
+    if (session.expiration < now) {
       continue;
     }
-    assert(record.get('owner') === 'root');
-    result.push(encodedSessionFromRecord(record));
+    assert(session.owner === 'root');
+    result.push(await encodeSession(session));
   }
   return result;
 }
 
-function fetchUserByEmail(
+async function fetchUserByEmail(
   services: ServerServices,
   email: string,
-): [key: string | undefined, record: Item | undefined] {
+): Promise<{
+  key: string | undefined;
+  item: Item<SchemaTypeUser> | undefined;
+}> {
   email = normalizeEmail(email);
-  const repo = services.sync.getSysDir();
-  let row = repo.indexes!.users.find((_k, r) => r.get('email') === email, 1)[0];
-  // Lazily create operator records
-  if (services.settings.operatorEmails.includes(email)) {
-    if (!row) {
-      const record = new Item({
-        scheme: Scheme.user(),
-        data: {
-          email,
-          permissions: new Set(kAllUserPermissions),
-        },
-      });
-      const key = uniqueId();
-      repo.setValueForKey(key, record, undefined);
-      row = [key, record];
-    } else {
-      const permissions =
-        row[1].get<Set<string>>('permissions') || new Set<string>();
-      let updated = false;
-      for (const p of kAllUserPermissions) {
-        if (!permissions.has(p)) {
-          permissions.add(p);
-          updated = true;
-        }
-      }
-      if (updated) {
-        row[1].set('permissions', permissions);
-        const key = row[0];
-        repo.setValueForKey(key, row[1], repo.headForKey(key));
-      }
-    }
+  const query = services.db.query({
+    schema: kSchemaUser,
+    source: '/sys/users',
+    sortDescriptor: ({ left, right }) =>
+      coreValueCompare(left.get('email'), right.get('email')),
+  });
+  await query.loadingFinished();
+  const results = query.results();
+  const userIdx = bsearch_idx(results.length, (idx) =>
+    coreValueCompare(results[idx].item.get('email'), email),
+  );
+  if (userIdx >= 0) {
+    return results[userIdx];
   }
-  return row ? [row[0]!, row[1]] : [undefined, undefined];
+  // Lazily create operator users
+  if (services.settings.operatorEmails.includes(email)) {
+    const item = services.db.create('/sys/users', kSchemaUser, {
+      email: email,
+    });
+    const key = itemPathGetPart(item.path, ItemPathPart.Item);
+    return {
+      key,
+      item: services.db
+        .repository('/sys/users')!
+        .valueForKey<SchemaTypeUser>(key)![0],
+    };
+  }
+  return { key: undefined, item: undefined };
 }
 
-export function fetchSessionById(
+export async function fetchSessionById(
   services: ServerServices,
   sessionId: string,
-): Session | undefined {
-  return services.trustPool.getSession(sessionId);
+): Promise<Session | undefined> {
+  return (await services.db.getTrustPool()).getSession(sessionId);
 }
 
 export function fetchUserById(
   services: ServerServices,
   userId: string,
-): Item | undefined {
-  const record = services.sync.getSysDir().valueForKey(userId);
-  assert(record.isNull || record.scheme.namespace === SchemeNamespace.USERS);
-  return record.isNull ? undefined : record;
+): Item<SchemaTypeUser> | undefined {
+  const entry = services.db
+    .repository('/sys/users')!
+    .valueForKey<SchemaTypeUser>(userId);
+  return entry && entry[0];
 }
 
 function responseForError(err: AuthError): Response {
@@ -383,17 +393,21 @@ export async function requireSignedUser(
   requestOrSignature: Request | string,
   role?: Role,
 ): Promise<
-  [userId: string | null, userRecord: Item | undefined, userSession: Session]
+  [
+    userId: string | null,
+    userItem: Item<SchemaTypeUser> | undefined,
+    userSession: Session,
+  ]
 > {
   const signature =
     typeof requestOrSignature === 'string'
       ? requestOrSignature
-      : requestOrSignature.headers.get('x-ovvio-sig');
+      : requestOrSignature.headers.get('x-goat-sig');
 
   if (!signature) {
     throw accessDenied();
   }
-  const signerSession = fetchSessionById(
+  const signerSession = await fetchSessionById(
     services,
     sessionIdFromSignature(signature),
   );
@@ -414,15 +428,15 @@ export async function requireSignedUser(
     }
     throw accessDenied();
   }
-  const userRecord = fetchUserById(services, userId);
-  if (userRecord === undefined) {
+  const userItem = fetchUserById(services, userId);
+  if (userItem === undefined) {
     throw accessDenied();
   }
-  if (userRecord.get('isDeleted', 0) !== 0) {
+  if (userItem.isDeleted) {
     throw accessDenied();
   }
   if (role === 'operator') {
-    const email = userRecord.get<string>('email');
+    const email = userItem.get('email');
     if (email === undefined || email.length <= 0) {
       throw accessDenied();
     }
@@ -430,5 +444,5 @@ export async function requireSignedUser(
       throw accessDenied();
     }
   }
-  return [userId, userRecord, signerSession];
+  return [userId, userItem, signerSession];
 }

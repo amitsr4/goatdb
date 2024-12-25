@@ -17,11 +17,11 @@ import { Code, ServerError, serviceUnavailable } from '../cfds/base/errors.ts';
 import { concatChanges, DataChanges } from '../cfds/base/object.ts';
 import { Item } from '../cfds/base/item.ts';
 import {
-  kNullScheme,
-  kSchemeSession,
-  Scheme,
-  SchemeEquals,
-} from '../cfds/base/scheme.ts';
+  kNullSchema,
+  kSchemaSession,
+  Schema,
+  SchemaEquals,
+} from '../cfds/base/schema.ts';
 import { Commit, commitContentsIsDocument, DeltaContents } from './commit.ts';
 import { AdjacencyList } from '../base/adj-list.ts';
 import { RendezvousHash } from '../base/rendezvous-hash.ts';
@@ -34,7 +34,7 @@ import { SchedulerPriority } from '../base/coroutine.ts';
 import { CONNECTION_ID } from './commit.ts';
 import { compareStrings } from '../base/string.ts';
 import { RedBlackTree } from 'std/data_structures/red_black_tree.ts';
-import { GoatDB } from '../db/db.ts';
+import { AuthRule, GoatDB } from '../db/db.ts';
 // import { BloomFilter } from '../base/bloom.ts';
 import { BloomFilter } from '../cpp/bloom_filter.ts';
 
@@ -61,13 +61,6 @@ export interface RepoStorage<T extends RepoStorage<T>> {
   // ageForKey(key: string): number;
 }
 
-export type Authorizer<ST extends RepoStorage<ST>> = (
-  repo: Repository<ST>,
-  commit: Commit,
-  session: Session,
-  write: boolean,
-) => boolean;
-
 interface CachedHead {
   commit: Commit;
   timestamp: number;
@@ -80,7 +73,7 @@ export interface CommitGraph {
 
 export interface RepositoryConfig<T extends RepoStorage<T> = MemRepoStorage> {
   allowedNamespaces?: string[];
-  authorizer?: Authorizer<T>;
+  authorizer?: AuthRule;
   priorityRepo?: boolean;
   storage?: T;
 }
@@ -93,7 +86,7 @@ export class Repository<
   readonly trustPool: TrustPool;
   readonly allowedNamespaces: string[] | undefined;
   private readonly _cachedHeadsByKey: Map<string, CachedHead>;
-  readonly authorizer?: Authorizer<ST>;
+  readonly authorizer?: AuthRule;
   private readonly _cachedRecordForCommit: Map<string, Item>;
   private readonly _cachedValueForKey: Map<string, [Item, Commit] | undefined>;
   private readonly _adjList: AdjacencyList;
@@ -110,7 +103,7 @@ export class Repository<
 
   constructor(
     readonly db: GoatDB,
-    readonly id: string,
+    readonly path: string,
     trustPool: TrustPool,
     {
       allowedNamespaces,
@@ -120,7 +113,7 @@ export class Repository<
     }: RepositoryConfig<ST> = {},
   ) {
     super();
-    this.id = Repository.normalizeId(id);
+    this.path = Repository.normalizePath(path);
     this.storage = storage || (new MemRepoStorage() as unknown as ST);
     this.trustPool = trustPool;
     this.allowedNamespaces = allowedNamespaces;
@@ -137,8 +130,8 @@ export class Repository<
     this._cachedLeavesForKey = new Map();
   }
 
-  static id(storage: string, id: string): string {
-    return this.normalizeId(`${storage}/${id}`);
+  static path(storage: string, id: string): string {
+    return this.normalizePath(`${storage}/${id}`);
   }
 
   static parseId(id: string): [storage: string, id: string] {
@@ -150,7 +143,7 @@ export class Repository<
     return comps as [string, string];
   }
 
-  static normalizeId(id: string): string {
+  static normalizePath(id: string): string {
     if (!id.startsWith('/')) {
       id = '/' + id;
     }
@@ -160,7 +153,7 @@ export class Repository<
     return id;
   }
 
-  static readonly sysDirId = this.id('sys', 'dir');
+  static readonly sysDirId = this.path('sys', 'dir');
 
   get orgId(): string {
     return this.trustPool.orgId;
@@ -193,7 +186,7 @@ export class Repository<
       session.id !== this.trustPool.currentSession.id &&
       authorizer
     ) {
-      if (!authorizer(this, c, session, false)) {
+      if (!authorizer(this.db, this.path, c.key, session, 'read')) {
         throw serviceUnavailable();
       }
     }
@@ -217,7 +210,7 @@ export class Repository<
       if (!cachedCommits) {
         cachedCommits = Array.from(
           filterIterable(this.storage.allCommitsIds(), (id) =>
-            authorizer(this, this.getCommit(id), session, false),
+            authorizer(this.db, this.path, id, session, 'read'),
           ),
         );
         this._cachedCommitsPerUser.set(uid, cachedCommits);
@@ -240,7 +233,7 @@ export class Repository<
         !session ||
         session.id === this.trustPool.currentSession.id ||
         !authorizer ||
-        authorizer(this, c, session, false)
+        authorizer(this.db, this.path, c.key, session, 'read')
       ) {
         yield c;
       }
@@ -364,7 +357,7 @@ export class Repository<
       authorizer
     ) {
       return filterIterable(this.storage.allKeys(), (key) =>
-        authorizer(this, this.headForKey(key)!, session, false),
+        authorizer(this.db, this.path, key, session, 'read'),
       );
     }
     return this.storage.allKeys();
@@ -392,18 +385,18 @@ export class Repository<
   ): [
     commits: Commit[],
     base: Commit | undefined,
-    scheme: Scheme,
+    scheme: Schema,
     reachedRoot: boolean,
   ] {
     let result: Commit | undefined;
-    let scheme = kNullScheme;
+    let scheme = kNullSchema;
     let reachedRoot = false;
     const includedCommits: Commit[] = [];
     for (const c of commits) {
       if (!result) {
         if (this.hasRecordForCommit(c)) {
           result = c;
-          scheme = this.recordForCommit(c).scheme;
+          scheme = this.recordForCommit(c).schema;
           includedCommits.push(c);
         }
         continue;
@@ -422,7 +415,7 @@ export class Repository<
       }
       result = newBase;
       includedCommits.push(c);
-      const s = this.recordForCommit(c).scheme;
+      const s = this.recordForCommit(c).schema;
       assert(scheme.ns === null || scheme.ns === s.ns); // Sanity check
       if (s.version > (scheme?.version || 0)) {
         scheme = s;
@@ -664,7 +657,7 @@ export class Repository<
 
   static callCount = 0;
 
-  recordForCommit<S extends Scheme>(c: Commit | string): Item<S> {
+  recordForCommit<S extends Schema>(c: Commit | string): Item<S> {
     try {
       if (++Repository.callCount === 2) {
         debugger;
@@ -881,14 +874,14 @@ export class Repository<
       .filter((c) => c.parents.length > 0)
       .sort(compareCommitsAsc);
     // Find the base for our N-way merge
-    let lca: Commit | undefined, scheme: Scheme, foundRoot: boolean;
+    let lca: Commit | undefined, scheme: Schema, foundRoot: boolean;
     // When merging roots, we use the null record as the merge base
     if (roots.length > 0) {
       scheme = roots[0].scheme!;
       foundRoot = true;
     } else if (commitsToMerge.length === 1) {
       // Special case: a single chain of commits.
-      scheme = this.recordForCommit(commitsToMerge[0]).scheme || kNullScheme;
+      scheme = this.recordForCommit(commitsToMerge[0]).schema || kNullSchema;
       foundRoot = false;
     } else {
       [commitsToMerge, lca, scheme, foundRoot] =
@@ -903,7 +896,7 @@ export class Repository<
     const base = lca ? this.recordForCommit(lca).clone() : Item.nullItem();
     // Upgrade base to merge scheme
     if (scheme.ns !== null) {
-      base.upgradeScheme(scheme);
+      base.upgradeSchema(scheme);
     }
     // Compute all changes to be applied in this merge
     let changes: DataChanges = {};
@@ -930,7 +923,7 @@ export class Repository<
       // for this merge.
       if (scheme.ns !== null) {
         record = record.clone();
-        record.upgradeScheme(scheme);
+        record.upgradeSchema(scheme);
       }
       changes = concatChanges(
         changes,
@@ -1045,7 +1038,7 @@ export class Repository<
     return undefined;
   }
 
-  valueForKey<T extends Scheme = Scheme>(
+  valueForKey<T extends Schema = Schema>(
     key: string,
   ): [Item<T>, Commit] | undefined {
     let result = this._cachedValueForKey.get(key);
@@ -1072,7 +1065,7 @@ export class Repository<
    * returned value, future calls to `valueForKey` will return the updated
    * record.
    */
-  async setValueForKey<S extends Scheme>(
+  async setValueForKey<S extends Schema>(
     key: string,
     value: Item<S>,
     parentCommit: string | Commit | undefined,
@@ -1088,7 +1081,7 @@ export class Repository<
     }
     assert(
       !this.allowedNamespaces ||
-        this.allowedNamespaces.includes(value.scheme.ns!),
+        this.allowedNamespaces.includes(value.schema.ns!),
     );
     const latest = this.valueForKey(key);
     if (latest && latest[0].isEqual(value as unknown as Item)) {
@@ -1129,7 +1122,7 @@ export class Repository<
     return (await this.mergeIfNeeded(key)) || signedCommit;
   }
 
-  async create<S extends Scheme>(key: string, value: Item<S>): Promise<Commit> {
+  async create<S extends Schema>(key: string, value: Item<S>): Promise<Commit> {
     return (await this.setValueForKey(key, value, undefined))!;
   }
 
@@ -1147,7 +1140,7 @@ export class Repository<
    *          This record can be used to safely update the UI, as well as update
    *          the repo value.
    */
-  rebase<S extends Scheme>(
+  rebase<S extends Schema>(
     key: string,
     record: Item<S>,
     headId: string | Commit | undefined,
@@ -1165,12 +1158,12 @@ export class Repository<
       : (Item.nullItem() as Item<S>);
     if (
       !headRecord.isNull &&
-      !SchemeEquals(baseRecord.scheme, headRecord.scheme)
+      !SchemaEquals(baseRecord.schema, headRecord.schema)
     ) {
-      baseRecord.upgradeScheme(headRecord.scheme);
+      baseRecord.upgradeSchema(headRecord.schema);
     }
-    if (!record.isNull && !SchemeEquals(baseRecord.scheme, record.scheme)) {
-      baseRecord.upgradeScheme(record.scheme);
+    if (!record.isNull && !SchemaEquals(baseRecord.schema, record.schema)) {
+      baseRecord.upgradeSchema(record.schema);
     }
     const changes = concatChanges(
       baseRecord.diff(headRecord, false),
@@ -1188,7 +1181,7 @@ export class Repository<
       randomInt(0, 20) === 0 ||
       // Sessions are too important to apply delta compression to, since they
       // bootstrap everything else.
-      fullCommit.scheme?.ns === kSchemeSession.ns
+      fullCommit.scheme?.ns === kSchemaSession.ns
     ) {
       return fullCommit;
     }
@@ -1269,7 +1262,7 @@ export class Repository<
                 if (!session) {
                   return;
                 }
-                if (authorizer(this, c, session, true)) {
+                if (authorizer(this.db, this.path, c.key, session, 'write')) {
                   result.push(c);
                 } else {
                   debugger;
@@ -1375,18 +1368,18 @@ export class Repository<
     //   result.filter((c) => this.commitIsHighProbabilityLeaf(c)),
     // )) {
     for (const c of commitsAffectingTmpRecords) {
-      this._runUpdatesOnNewLeafCommit(c);
+      await this._runUpdatesOnNewLeafCommit(c);
     }
     // Notify everyone else
+    for (const c of result) {
+      this.emit('NewCommitSync', c);
+    }
     if (this.priorityRepo || typeof Deno !== 'undefined') {
       // Do it synchronously in the server
       for (const c of result) {
         this.emit('NewCommit', c);
       }
     } else {
-      for (const c of result) {
-        this.emit('NewCommitSync', c);
-      }
       // And asynchronously in the client
       CoroutineScheduler.sharedScheduler().forEach(
         result,
@@ -1397,17 +1390,18 @@ export class Repository<
     return result;
   }
 
-  private _runUpdatesOnNewLeafCommit(commit: Commit): void {
+  private async _runUpdatesOnNewLeafCommit(commit: Commit): Promise<void> {
     // Auto add newly discovered sessions to our trust pool
-    if (commit.scheme?.ns === kSchemeSession.ns) {
+    if (commit.scheme?.ns === kSchemaSession.ns) {
       this._cachedHeadsByKey.delete(commit.key);
       const headEntry = this.valueForKey(commit.key);
       if (!headEntry) {
         return;
       }
-      sessionFromRecord(headEntry[0]).then((session) => {
-        this.trustPool.addSession(session, commit);
-      });
+      await this.trustPool.addSession(
+        await sessionFromRecord(headEntry[0]),
+        commit,
+      );
     }
     this.emit('DocumentChanged', commit.key);
   }

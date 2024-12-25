@@ -1,10 +1,17 @@
-import React, { useContext, useEffect, useState } from 'react';
-import { GoatDB, type DBConfig } from '../db/db.ts';
-import { Scheme } from '../cfds/base/scheme.ts';
+import React, {
+  useCallback,
+  useContext,
+  useEffect,
+  useState,
+  useSyncExternalStore,
+} from 'react';
+import { GoatDB } from '../db/db.ts';
+import { Schema } from '../cfds/base/schema.ts';
 import { ManagedItem } from '../db/managed-item.ts';
 import { MutationPack, mutationPackHasField } from '../db/mutations.ts';
 import { ReadonlyJSONValue } from '../base/interfaces.ts';
 import { Query, QueryConfig } from '../repo/query.ts';
+import { getBaseURL } from '../net/rest-api.ts';
 
 type GoatDBCtxProps = {
   db?: GoatDB;
@@ -22,7 +29,7 @@ const GoatDBContext = React.createContext<GoatDBCtxProps>({});
 export function useDB(): GoatDB {
   const ctx = useContext(GoatDBContext);
   if (!ctx.db) {
-    ctx.db = new GoatDB({ path: '/data/db' });
+    ctx.db = new GoatDB({ path: '/data/db', peers: getBaseURL() });
   }
   return ctx.db;
 }
@@ -31,21 +38,21 @@ export type UseItemOpts = {
   keys?: string | string[];
 };
 
-export function useItem<S extends Scheme>(
+export function useItem<S extends Schema>(
   opts: UseItemOpts,
   ...pathCompsOrOpts: string[]
 ): ManagedItem<S>;
 
-export function useItem<S extends Scheme>(
+export function useItem<S extends Schema>(
   path: string,
   opts: UseItemOpts,
 ): ManagedItem<S>;
 
-export function useItem<S extends Scheme>(
+export function useItem<S extends Schema>(
   ...pathCompsOrOpts: string[]
 ): ManagedItem<S>;
 
-export function useItem<S extends Scheme>(
+export function useItem<S extends Schema>(
   ...pathCompsOrOpts: (string | UseItemOpts)[]
 ): ManagedItem<S> {
   const db = useDB();
@@ -80,7 +87,7 @@ export function useItem<S extends Scheme>(
 }
 
 export interface UseQueryOpts<
-  IS extends Scheme,
+  IS extends Schema,
   CTX extends ReadonlyJSONValue,
   OS extends IS = IS,
 > extends Omit<QueryConfig<IS, OS, CTX>, 'db'> {
@@ -88,39 +95,55 @@ export interface UseQueryOpts<
 }
 
 export function useQuery<
-  IS extends Scheme,
+  IS extends Schema,
   CTX extends ReadonlyJSONValue,
   OS extends IS = IS,
 >(config: UseQueryOpts<IS, CTX, OS>): Query<IS, OS, CTX> {
   const db = useDB();
-  let change = 0;
-  const [_, setRenderCount] = useState(change);
   const query = db.query(config);
-  useEffect(() => {
-    if (config.showIntermittentResults === true) {
-      return query.onResultsChanged(() => setRenderCount(++change));
-    } else {
-      let cancelOnResultsChanged: undefined | (() => void);
-      let cancelOnLoading: undefined | (() => void) = query.onLoadingFinished(
-        () => {
-          cancelOnResultsChanged = query.onResultsChanged(() =>
-            setRenderCount(++change),
-          );
-          cancelOnLoading = undefined;
-          setRenderCount(++change);
-        },
-      );
-      return () => {
-        if (cancelOnResultsChanged) {
-          cancelOnResultsChanged();
-          cancelOnResultsChanged = undefined;
-        }
-        if (cancelOnLoading) {
-          cancelOnLoading();
-          cancelOnLoading = undefined;
-        }
-      };
-    }
-  }, [query]);
+  const subscribe = useCallback(
+    (onStoreChange: () => void) => query.onResultsChanged(onStoreChange),
+    [query],
+  );
+  const getSnapshot = useCallback(() => query.results(), [query]);
+  useSyncExternalStore(subscribe, getSnapshot);
   return query;
+}
+
+export type DBReadyState = 'loading' | 'ready' | 'error';
+
+export function useDBReady(): DBReadyState {
+  const db = useDB();
+  let error = false;
+  const subscribe = useCallback(
+    (onStoreChange: () => void) => {
+      if (!db.ready) {
+        let cancelled = false;
+        db.readyPromise()
+          .then(() => {
+            if (!cancelled) {
+              onStoreChange();
+            }
+          })
+          .catch(() => {
+            error = true;
+            if (!cancelled) {
+              onStoreChange();
+            }
+          });
+        return () => {
+          cancelled = true;
+        };
+      }
+      return () => {};
+    },
+    [db],
+  );
+  const getSnapshot = useCallback(() => {
+    if (error) {
+      return 'error';
+    }
+    return db.ready ? 'ready' : 'loading';
+  }, [db]);
+  return useSyncExternalStore(subscribe, getSnapshot);
 }

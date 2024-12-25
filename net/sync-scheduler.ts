@@ -10,6 +10,7 @@ import { serviceUnavailable } from '../cfds/base/errors.ts';
 import { log } from '../logging/log.ts';
 import { SyncMessage } from './message.ts';
 import { sendJSONToURL } from './rest-api.ts';
+import { SchemaManager } from '../cfds/base/schema.ts';
 
 const K_MAX_REQ_BATCH = 10;
 
@@ -52,7 +53,7 @@ export function syncConfigGetCycles(
 }
 
 interface SyncRequest {
-  id: string;
+  path: string;
   msg: SyncMessage;
 }
 
@@ -81,6 +82,7 @@ export class SyncScheduler {
     readonly syncConfig: SyncConfig,
     readonly trustPool: TrustPool,
     readonly orgId: string,
+    readonly schemaManager: SchemaManager,
   ) {
     this._syncFreqAvg = new MovingAverage(
       syncConfigGetCycles(kSyncConfigClient) * 2,
@@ -101,7 +103,7 @@ export class SyncScheduler {
   }
 
   send(
-    id: string,
+    path: string,
     msg: SyncMessage,
     priority: SyncPriority = SyncPriority.normal,
   ): Promise<SyncMessage> {
@@ -116,7 +118,7 @@ export class SyncScheduler {
       queue = [];
       this._pendingRequests.set(priority, queue);
     }
-    queue.push({ req: { id, msg }, resolve, reject });
+    queue.push({ req: { path, msg }, resolve, reject });
     return result;
   }
 
@@ -154,7 +156,7 @@ export class SyncScheduler {
       this._fetchInProgress = true;
       const start = performance.now();
       const resp = await sendJSONToURL(
-        this.url,
+        this.url + '/batch-sync',
         this.trustPool.currentSession,
         reqArr,
         this.orgId,
@@ -195,14 +197,17 @@ export class SyncScheduler {
       for (const req of pendingRequests) {
         let found = false;
         for (const resp of json as ReadonlyJSONObject[]) {
-          if (resp.id === req.req.id) {
+          if (resp.path === req.req.path) {
             const decoder = JSONCyclicalDecoder.get(
               resp.res as ReadonlyJSONObject,
             );
-            const syncResp = await SyncMessage.decodeAsync({
-              decoder: decoder,
-              orgId: this.orgId,
-            });
+            const syncResp = await SyncMessage.decodeAsync(
+              {
+                decoder: decoder,
+                orgId: this.orgId,
+              },
+              this.schemaManager,
+            );
             decoder.finalize();
             req.resolve(syncResp);
             found = true;

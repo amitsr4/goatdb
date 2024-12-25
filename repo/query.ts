@@ -4,43 +4,43 @@ import { Commit } from './commit.ts';
 import { Emitter } from '../base/emitter.ts';
 import { NextEventLoopCycleTimer } from '../base/timer.ts';
 import { md51 } from '../external/md5.ts';
-import { Scheme } from '../cfds/base/scheme.ts';
+import { Schema } from '../cfds/base/schema.ts';
 import { BloomFilter } from '../base/bloom.ts';
 import { GoatDB } from '../db/db.ts';
 import { ReadonlyJSONValue } from '../base/interfaces.ts';
 
 const BLOOM_FPR = 0.01;
 
-export type Entry<S extends Scheme = Scheme> = [
+export type Entry<S extends Schema = Schema> = [
   key: string | null,
   item: Item<S>,
 ];
-export type PredicateInfo<S extends Scheme, CTX> = {
+export type PredicateInfo<S extends Schema, CTX> = {
   key: string;
   item: Item<S>;
   ctx: CTX;
 };
-export type Predicate<S extends Scheme, CTX extends ReadonlyJSONValue> = (
+export type Predicate<S extends Schema, CTX extends ReadonlyJSONValue> = (
   info: PredicateInfo<S, CTX>,
 ) => boolean;
 
-export type SortInfo<S extends Scheme, CTX> = {
+export type SortInfo<S extends Schema, CTX> = {
   left: Item<S>;
   right: Item<S>;
   keyLeft: string;
   keyRight: string;
   ctx: CTX;
 };
-export type SortDescriptor<S extends Scheme, CTX> = (
+export type SortDescriptor<S extends Schema, CTX> = (
   info: SortInfo<S, CTX>,
 ) => number;
-export type QuerySource<IS extends Scheme = Scheme, OS extends IS = IS> =
+export type QuerySource<IS extends Schema = Schema, OS extends IS = IS> =
   | Repository
   | Query<IS, OS, ReadonlyJSONValue>
   | string;
 
 export type QueryConfig<
-  IS extends Scheme,
+  IS extends Schema,
   OS extends IS,
   CTX extends ReadonlyJSONValue,
 > = {
@@ -48,15 +48,16 @@ export type QueryConfig<
   source: QuerySource<IS, OS>;
   predicate?: Predicate<IS, CTX>;
   sortDescriptor?: SortDescriptor<OS, CTX>;
-  scheme?: IS;
+  schema?: IS;
   id?: string;
   ctx?: CTX;
+  limit?: number;
 };
 
 export type QueryEvent = EventDocumentChanged | 'LoadingFinished' | 'Closed';
 
 export class Query<
-  IS extends Scheme,
+  IS extends Schema,
   OS extends IS,
   CTX extends ReadonlyJSONValue,
 > extends Emitter<QueryEvent> {
@@ -64,6 +65,7 @@ export class Query<
   readonly db: GoatDB;
   readonly context: CTX;
   readonly scheme?: IS;
+  readonly limit: number = 0;
   private readonly source: QuerySource<IS, OS>;
   private _predicateInfo?: PredicateInfo<IS, CTX>;
   private readonly predicate: Predicate<IS, CTX>;
@@ -83,6 +85,7 @@ export class Query<
   private _closed = false;
   private _cachedResults: { key: string; item: Item<OS> }[] | undefined;
   private _cachedResultsAge = 0;
+  private _loading: boolean = true;
 
   // static open<
   //   IS extends Scheme = Scheme,
@@ -110,17 +113,19 @@ export class Query<
     predicate,
     sortDescriptor,
     ctx,
-    scheme,
+    schema,
+    limit,
   }: QueryConfig<IS, OS, CTX>) {
     super();
     this.db = db;
     if (!predicate) {
       predicate = () => true;
     }
-    this.id = id || generateQueryId(predicate, sortDescriptor, ctx, scheme?.ns);
+    this.id = id || generateQueryId(predicate, sortDescriptor, ctx, schema?.ns);
     this.context = ctx as CTX;
     this.source = source;
-    this.scheme = scheme;
+    this.scheme = schema;
+    this.limit = limit || 0;
     this.predicate = predicate;
     this.sortDescriptor = sortDescriptor;
     this._headIdForKey = new Map();
@@ -137,7 +142,7 @@ export class Query<
 
   get repo(): Repository {
     if (typeof this.source === 'string') {
-      return this.db.getRepository(this.source)!;
+      return this.db.repository(this.source)!;
     }
     return this.source instanceof Repository ? this.source : this.source.repo;
   }
@@ -156,6 +161,10 @@ export class Query<
 
   get age(): number {
     return this._age;
+  }
+
+  get loading(): boolean {
+    return this._loading;
   }
 
   has(key: string): boolean {
@@ -263,7 +272,7 @@ export class Query<
     if (!this._closed) {
       this.emit('Closed');
       this.repo.db.queryPersistence?.unregister(
-        this as unknown as Query<Scheme, Scheme, ReadonlyJSONValue>,
+        this as unknown as Query<Schema, Schema, ReadonlyJSONValue>,
       );
       if (this._sourceListenerCleanup) {
         this._sourceListenerCleanup();
@@ -278,7 +287,7 @@ export class Query<
   protected suspend(): void {
     if (!this._closed) {
       this.repo.db.queryPersistence?.unregister(
-        this as unknown as Query<Scheme, Scheme, ReadonlyJSONValue>,
+        this as unknown as Query<Schema, Schema, ReadonlyJSONValue>,
       );
       this._sourceListenerCleanup!();
       this._sourceListenerCleanup = undefined;
@@ -287,15 +296,11 @@ export class Query<
   }
 
   private addKeyToResults(key: string, currentDoc: Item<IS>): void {
-    // Remove any previous entry, to account for order changes
-    // if (this._bloomFilter.has(key)) {
-    //   const idx = this._includedKeys.indexOf(key);
-    //   if (idx >= 0) {
-    //     this._includedKeys.splice(idx, 1);
-    //   }
-    // }
     // Insert to the results set
-    if (this.has(key)) {
+    if (
+      this.has(key) ||
+      (this.limit > 0 && this._includedKeys.length >= this.limit)
+    ) {
       return;
     }
     this._includedKeys.push(key);
@@ -331,7 +336,7 @@ export class Query<
           this._predicateInfo.ctx = this.context;
         }
         if (
-          (!this.scheme || this.scheme.ns === currentDoc.scheme.ns) &&
+          (!this.scheme || this.scheme.ns === currentDoc.schema.ns) &&
           this.predicate(this._predicateInfo!)
         ) {
           this.addKeyToResults(key, currentDoc);
@@ -358,8 +363,8 @@ export class Query<
     const repo = this.repo;
     const key = commit.key;
     const prevHeadId = this._headIdForKey.get(key);
-    debugger;
     const currentHead = repo.headForKey(key);
+    this._age = Math.max(this._age, commit.age || 0);
     if (currentHead && prevHeadId !== currentHead?.id) {
       const prevDoc = prevHeadId
         ? repo.recordForCommit(prevHeadId)
@@ -374,13 +379,12 @@ export class Query<
         currentHead,
       );
     }
-    this._age = Math.max(this._age, commit.age || 0);
   }
 
   private async scanRepo(): Promise<void> {
     const startTime = performance.now();
     const repo = this.repo;
-    const cache = await repo.db.queryPersistence?.get(repo.id, this.id);
+    const cache = await repo.db.queryPersistence?.get(repo.path, this.id);
     // let ageChange = 0;
     let skipped = 0;
     let total = 0;
@@ -426,9 +430,10 @@ export class Query<
       if (!this._loadingFinished) {
         this._loadingFinished = true;
         this.repo.db.queryPersistence?.register(
-          this as unknown as Query<Scheme, Scheme, ReadonlyJSONValue>,
+          this as unknown as Query<Schema, Schema, ReadonlyJSONValue>,
         );
         await this.repo.db.queryPersistence?.flush(this.id);
+        this._loading = false;
         this.emit('LoadingFinished');
       }
     }
@@ -461,7 +466,7 @@ export class Query<
 const gGeneratedQueryIds = new Map<string, string>();
 
 function generateQueryId<
-  IS extends Scheme = Scheme,
+  IS extends Schema = Schema,
   OS extends IS = IS,
   CTX extends ReadonlyJSONValue = ReadonlyJSONValue,
 >(

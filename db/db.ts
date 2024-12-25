@@ -1,28 +1,26 @@
 import * as path from 'std/path/mod.ts';
-import { TrustPool } from './session.ts';
+import { Session, TrustPool } from './session.ts';
 import { Repository, RepositoryConfig } from '../repo/repo.ts';
-import { DBSettingsProvider } from './settings/settings.ts';
+import { DBSettings, DBSettingsProvider } from './settings/settings.ts';
 import { FileSettings } from './settings/file.ts';
-import { IDBSettings } from './settings/idb.ts';
 import { Commit } from '../repo/commit.ts';
 import { RepoClient } from '../net/client.ts';
 import { kSyncConfigClient, kSyncConfigServer } from '../net/sync-scheduler.ts';
 import { SyncScheduler } from '../net/sync-scheduler.ts';
 import { QueryPersistence } from '../repo/query-persistance.ts';
-import { RepositoryPersistance } from './persistance/repo.ts';
 import { QueryPersistenceFile } from './persistance/query-file.ts';
 import { ManagedItem } from './managed-item.ts';
-import { Scheme } from '../cfds/base/scheme.ts';
+import { Schema, SchemaManager } from '../cfds/base/schema.ts';
 import {
+  itemPath,
   itemPathGetPart,
   itemPathGetRepoId,
   itemPathNormalize,
   ItemPathPart,
 } from './path.ts';
 import { isBrowser, uniqueId } from '../base/common.ts';
-import { SchemeDataType } from '../cfds/base/scheme.ts';
+import { SchemaDataType } from '../cfds/base/schema.ts';
 import { Item } from '../cfds/base/item.ts';
-import { SimpleTimer, Timer } from '../base/timer.ts';
 import {
   JSONLogFile,
   JSONLogFileAppend,
@@ -33,51 +31,110 @@ import {
   JSONLogFileStartCursor,
   startJSONLogWorkerIfNeeded,
 } from '../base/json-log/json-log.ts';
-import {
-  ReadonlyJSONArray,
-  ReadonlyJSONObject,
-  ReadonlyJSONValue,
-} from '../base/interfaces.ts';
+import { ReadonlyJSONObject, ReadonlyJSONValue } from '../base/interfaces.ts';
 import { BloomFilter } from '../cpp/bloom_filter.ts';
-import { MemRepoStorage } from '../repo/repo.ts';
 import { QueryConfig, Query } from '../repo/query.ts';
 import { md51 } from '../external/md5.ts';
+import { sendLoginEmail } from '../net/rest-api.ts';
+import { normalizeEmail } from '../base/string.ts';
+import { FileImplGet } from '../base/json-log/file-impl.ts';
+import { FileImplOPFS } from '../base/json-log/file-impl-opfs.ts';
+
+/**
+ * Denotes the type of the requested operation.
+ */
+export type AuthOp = 'read' | 'write';
+
+/**
+ * A function that implements access control rules for a given repository or
+ * group of repositories.
+ *
+ * Note that this method gets called repeatedly on every access attempt so it
+ * must be very efficient.
+ *
+ * @param db       The main DB instance.
+ * @param repoPath Path to the repository being accessed.
+ * @param itemKey  The key being accessed.
+ * @param session  The session requesting access.
+ * @param op       The access type being made.
+ *
+ * @returns true if access is granted, false otherwise.
+ */
+export type AuthRule = (
+  db: GoatDB,
+  repoPath: string,
+  itemKey: string,
+  session: Session,
+  op: AuthOp,
+) => boolean;
+
+/**
+ * An array of authentication rules for the full DB. The DB scans these rules
+ * and will use the first one that matches the repository's path.
+ */
+export type AuthConfig = {
+  path: RegExp | string;
+  rule: AuthRule;
+}[];
 
 export interface DBConfig {
+  /**
+   * Absolute path to the directory that'll store the DB's data.
+   */
   path: string;
+  /**
+   * Authorization rules for this DB instance. If not provided, all data is
+   * considered public.
+   */
+  authRules?: AuthConfig;
+  /**
+   * Optional organization id used to sandbox the data of a specific
+   * organization in a multi-tenant deployment. Defaults to "localhost".
+   */
   orgId?: string;
+  /**
+   * Absolute URLs of peers to sync with. Peers are must share the same
+   * public/private root keys of this instance.
+   */
   peers?: string | Iterable<string>;
+  /**
+   * The schema manager to use for this DB instance.
+   * Defaults to `SchemaManger.default`.
+   */
+  schemaManager?: SchemaManager;
 }
 
-export type OpenOptions = Omit<RepositoryConfig, 'storage'>;
-
-startJSONLogWorkerIfNeeded();
+export type OpenOptions = Omit<RepositoryConfig, 'storage' | 'authorizer'>;
 
 export class GoatDB {
   readonly orgId: string;
-  readonly path: string;
-  readonly queryPersistence?: QueryPersistence;
-  private readonly _settingsProvider: DBSettingsProvider;
+  readonly schemaManager: SchemaManager;
+  private readonly _basePath: string;
   private readonly _repositories: Map<string, Repository>;
   private readonly _openPromises: Map<string, Promise<Repository>>;
   private readonly _files: Map<string, JSONLogFile>;
   private readonly _peerURLs: string[] | undefined;
-  private readonly _peers: Map<string, RepoClient[]> | undefined;
+  private readonly _repoClients: Map<string, RepoClient[]> | undefined;
   private readonly _items: Map<string, ManagedItem>;
   private readonly _openQueries = new Map<
     string,
-    Query<Scheme, Scheme, ReadonlyJSONValue>
+    Query<Schema, Schema, ReadonlyJSONValue>
   >();
+  private readonly _authConfig: AuthConfig;
+  private _path: string | undefined;
+  private _settingsProvider: DBSettingsProvider | undefined;
+  queryPersistence?: QueryPersistence;
   private _trustPool: TrustPool | undefined;
   private _syncSchedulers: SyncScheduler[] | undefined;
+  private _trustPoolPromise: Promise<TrustPool>;
+  private _ready: boolean = false;
 
   constructor(config: DBConfig) {
-    this.path = config.path;
-    this._settingsProvider =
-      typeof self.Deno === 'undefined'
-        ? new IDBSettings()
-        : new FileSettings(this.path);
+    startJSONLogWorkerIfNeeded();
+    this._basePath = config.path;
+    this.schemaManager = config.schemaManager || SchemaManager.default;
     this.orgId = config?.orgId || 'localhost';
+    this._authConfig = config.authRules || [];
     this._repositories = new Map();
     this._openPromises = new Map();
     this._files = new Map();
@@ -88,13 +145,70 @@ export class GoatDB {
         typeof config.peers === 'string'
           ? [config.peers]
           : Array.from(new Set(config.peers));
-      this._peers = new Map();
+      this._repoClients = new Map();
     }
-    if (this.path) {
-      this.queryPersistence = new QueryPersistence(
-        new QueryPersistenceFile(this.path),
-      );
-    }
+    this._trustPoolPromise = this._getTrustPoolImpl();
+  }
+
+  get path(): string {
+    return this._path || this._basePath;
+  }
+
+  /**
+   * Returns whether this DB instance is ready to receive commands or is it
+   * still performing the initial load.
+   */
+  get ready(): boolean {
+    return this._ready;
+  }
+
+  /**
+   * Returns the settings object of this DB instance.
+   */
+  get settings(): DBSettings {
+    return this._settingsProvider!.settings;
+  }
+
+  /**
+   * Returns whether this DB instance uses an anonymous session or a session
+   * that's attached to a known user.
+   */
+  get loggedIn(): boolean {
+    return this._trustPool?.currentSession.owner !== undefined;
+  }
+
+  /**
+   * A convenience promise form of the `ready` flag. When the promise returns,
+   * this DB instance is ready to receive commands.
+   *
+   * @throws ServiceUnavailable if the initial load failed.
+   */
+  async readyPromise(): Promise<void> {
+    await this._trustPoolPromise;
+  }
+
+  /**
+   * When connecting to a new DB instance on the client, it'll start with an
+   * anonymous session that's not attached to any user in the system. Call this
+   * method with a user's email, to initiate an email-based login sequence that
+   * will end with the current session being attached to the user owning this
+   * email.
+   *
+   * This login sequence sends a temporary magic link to the provided email
+   * address. Once clicked, the user item will be automatically created in
+   * /sys/users and attached to the current session.
+   *
+   * @param   email The target of the magic link.
+   * @returns true if the magic link had been successfully sent, false
+   *          otherwise.
+   */
+  async loginWithMagicLinkEmail(email: string): Promise<boolean> {
+    return await sendLoginEmail(
+      (
+        await this.getTrustPool()
+      ).currentSession,
+      normalizeEmail(email),
+    );
   }
 
   /**
@@ -136,15 +250,15 @@ export class GoatDB {
     if (this._openPromises.has(repoId)) {
       await this._openPromises.get(repoId);
     }
-    const repo = this.getRepository(repoId);
+    const repo = this.repository(repoId);
     if (!repo) {
       return;
     }
     await this.flush(path);
-    for (const client of this._peers?.get(repoId) || []) {
+    for (const client of this._repoClients?.get(repoId) || []) {
       client.close();
     }
-    this._peers?.delete(repoId);
+    this._repoClients?.delete(repoId);
     const fileEntry = this._files.get(repoId);
     if (fileEntry) {
       await JSONLogFileClose(fileEntry);
@@ -166,16 +280,41 @@ export class GoatDB {
    * explicitly open the repository before accessing any of its items.
    *
    * @param pathComps A full path or path components.
-   * @returns A managed item that tracks both local and remote edits.
+   * @returns         A managed item that tracks both local and remote edits.
    */
-  item<S extends Scheme>(...pathComps: string[]): ManagedItem<S> {
+  item<S extends Schema>(...pathComps: string[]): ManagedItem<S> {
     const path = itemPathNormalize(pathComps.join('/'));
     let item = this._items.get(path);
     if (!item) {
       item = new ManagedItem(this, path);
       this._items.set(path, item);
-    } else {
-      item.rebase();
+    }
+    return item as unknown as ManagedItem<S>;
+  }
+
+  /**
+   * Creates a new item at the target repository, opening it if needed. Unlike
+   * `GoatDB.item()` there's no need to explicitly open a repository before
+   * creating items in it. Newly created items become immediately available for
+   * use and will get committed to the underlying repo after open completes.
+   *
+   * @param repoPath Path to the repository in which to create the item/
+   * @param schema   The schema to create the item with.
+   * @param data     The initial data to populate the item with.
+   * @returns        The newly created managed item.
+   */
+  create<S extends Schema>(
+    repoPath: string,
+    schema: S,
+    data: Partial<SchemaDataType<S>>,
+  ): ManagedItem<S> {
+    const path = itemPath(...Repository.parseId(repoPath), uniqueId());
+    let item = this._items.get(path);
+    if (!item) {
+      item = new ManagedItem(this, path);
+      this._items.set(path, item);
+      item.schema = schema;
+      item.setMulti(data);
     }
     return item as unknown as ManagedItem<S>;
   }
@@ -188,14 +327,14 @@ export class GoatDB {
    * NOTE: This method uses a different internal path than the Item based API,
    * and is much more efficient for bulk creations.
    *
-   * @param path The path for the item to create.
-   * @param scheme The scheme to create the item with.
-   * @param data The initial data for the item.
+   * @param path   The path for the item to create.
+   * @param schema The schema to create the item with.
+   * @param data   The initial data for the item.
    */
-  async create<S extends Scheme>(
+  async load<S extends Schema>(
     path: string,
-    scheme: S,
-    data: SchemeDataType<S>,
+    schema: S,
+    data: SchemaDataType<S>,
   ): Promise<void> {
     const repo = await this.open(path);
     let key = itemPathGetPart(path, ItemPathPart.Item);
@@ -204,10 +343,13 @@ export class GoatDB {
     }
     await repo.setValueForKey(
       key,
-      new Item<S>({
-        scheme,
-        data,
-      }),
+      new Item<S>(
+        {
+          schema,
+          data,
+        },
+        this.schemaManager,
+      ),
       undefined,
     );
   }
@@ -219,12 +361,12 @@ export class GoatDB {
    * NOTE: Currently only paths to repositories are supported.
    *
    * @param path The full path to count.
-   * @returns The number of items found or -1.
+   * @returns    The number of items found or -1.
    */
   count(path: string): number {
     path = itemPathNormalize(path);
     const repoId = itemPathGetRepoId(path);
-    return this.getRepository(repoId)?.storage.numberOfKeys() || -1;
+    return this.repository(repoId)?.storage.numberOfKeys() || -1;
   }
 
   /**
@@ -233,20 +375,23 @@ export class GoatDB {
    * NOTE: Currently only paths to repositories are supported.
    *
    * @param path Full path to a repository.
-   * @returns The keys at the specified path.
+   * @returns    The keys at the specified path.
    */
   keys(path: string): Iterable<string> {
     path = itemPathNormalize(path);
     const repoId = itemPathGetRepoId(path);
-    return this.getRepository(repoId)?.keys() || [];
+    return this.repository(repoId)?.keys() || [];
   }
 
   /**
-   * Open a new query or access an already open one.
-   * @param config
-   * @returns
+   * Open a new query or access an already open one. Once opened, the query
+   * remains open until explicitly closed, and tracks updates to items as they
+   * happen.
+   *
+   * @param config The configuration for the desired query.
+   * @returns      A live query instance.
    */
-  query<IS extends Scheme, CTX extends ReadonlyJSONValue, OS extends IS = IS>(
+  query<IS extends Schema, CTX extends ReadonlyJSONValue, OS extends IS = IS>(
     config: Omit<QueryConfig<IS, OS, CTX>, 'db'>,
   ): Query<IS, OS, CTX> {
     let id = config.id;
@@ -260,8 +405,8 @@ export class GoatDB {
     let q = this._openQueries.get(id);
     if (!q) {
       q = new Query({ ...config, db: this }) as unknown as Query<
-        Scheme,
-        Scheme,
+        Schema,
+        Schema,
         ReadonlyJSONValue
       >;
       q.once('Closed', () => {
@@ -274,25 +419,105 @@ export class GoatDB {
     return q as unknown as Query<IS, OS, CTX>;
   }
 
-  async getTrustPool(): Promise<TrustPool> {
-    if (!this._trustPool) {
-      await this._settingsProvider.load();
-      const settings = this._settingsProvider.settings;
-      this._trustPool = new TrustPool(
-        this.orgId,
-        settings.currentSession,
-        settings.roots,
-        settings.trustedSessions,
+  /**
+   * Flushes all pending writes for the given repository to disk. Use this
+   * method when you must ensure all previously known commits are written to the
+   * local disk.
+   *
+   * @param path Path to the desired repository.
+   * @returns    A promise that resolves after all commits have been flushed to
+   *             disk.
+   */
+  flush(path: string): Promise<void> {
+    path = itemPathNormalize(path);
+    const fileEntry = this._files.get(itemPathGetRepoId(path));
+    return fileEntry ? JSONLogFileFlush(fileEntry) : Promise.resolve();
+  }
+
+  /**
+   * Returns the requested repository or undefined if it wasn't opened yet.
+   *
+   * Note: Prefer to use the higher level APIs of this class rather than the
+   * repository instance directly.
+   *
+   * @param path A full path or path components.
+   * @returns    The repository instance or undefined.
+   */
+  repository(...pathComps: string[]): Repository | undefined {
+    return this._repositories.get(
+      Repository.normalizePath(pathComps.join('/')),
+    );
+  }
+
+  /**
+   * Returns the trust pool of this DB instance. The trust pool is a low level
+   * object that manages all known sessions and their public keys. It is used
+   * to verify the authenticity of the underlying commit graph before persisting
+   * it to the local storage.
+   *
+   * Note: You almost never need to use the trust pool directly.
+   *
+   * @returns The trust pool of this DB instance.
+   */
+  getTrustPool(): Promise<TrustPool> {
+    return this._trustPoolPromise;
+  }
+
+  private async _getTrustPoolImpl(): Promise<TrustPool> {
+    await this._createTrustPool();
+    // Open /sys/sessions so all known sessions are properly loaded into our
+    // new trust pool
+    await this.open('/sys/sessions');
+    // Open /sys/users so we can perform login and basic operations without
+    // waiting
+    await this.open('/sys/users');
+    this._ready = true;
+    return this._trustPool!;
+  }
+
+  clientsForRepo(...pathComps: string[]): Iterable<RepoClient> {
+    const repoId = Repository.normalizePath(pathComps.join('/'));
+    return this._repoClients?.get(repoId) || [];
+  }
+
+  private async _createTrustPool(): Promise<void> {
+    const fileIndex = await pickInstanceNumber();
+    debugger;
+    this._path = fileIndex
+      ? path.join(
+          path.dirname(this._basePath),
+          path.basename(this._basePath) + '_' + fileIndex,
+        )
+      : this._basePath;
+    this._settingsProvider = new FileSettings(
+      this._path,
+      isBrowser() ? 'client' : 'server',
+    );
+    this.queryPersistence = new QueryPersistence(
+      new QueryPersistenceFile(this._path),
+    );
+
+    await this._settingsProvider.load();
+    const settings = this._settingsProvider.settings;
+    this._trustPool = new TrustPool(
+      this.orgId,
+      settings.currentSession,
+      settings.roots,
+      settings.trustedSessions,
+    );
+    if (this._peerURLs) {
+      const syncConfig = isBrowser() ? kSyncConfigClient : kSyncConfigServer;
+      this._syncSchedulers = this._peerURLs.map(
+        (url) =>
+          new SyncScheduler(
+            url,
+            syncConfig,
+            this._trustPool!,
+            this.orgId,
+            this.schemaManager,
+          ),
       );
-      if (this._peerURLs) {
-        const syncConfig = isBrowser() ? kSyncConfigClient : kSyncConfigServer;
-        this._syncSchedulers = this._peerURLs.map(
-          (url) =>
-            new SyncScheduler(url, syncConfig, this._trustPool!, this.orgId),
-        );
-      }
     }
-    return this._trustPool;
   }
 
   private async _openImpl(
@@ -300,8 +525,19 @@ export class GoatDB {
     opts?: OpenOptions,
   ): Promise<Repository> {
     await BloomFilter.initNativeFunctions();
-    repoId = Repository.normalizeId(repoId);
-    const repo = new Repository(this, repoId, await this.getTrustPool(), opts);
+    repoId = Repository.normalizePath(repoId);
+    let trustPool: TrustPool;
+    // Special Case: skip the call to loadSysSessions() when loading user
+    // related repos to avoid a loop.
+    if (repoId === '/sys/sessions' || repoId === '/sys/users') {
+      trustPool = this._trustPool!;
+    } else {
+      trustPool = await this.getTrustPool();
+    }
+    const repo = new Repository(this, repoId, trustPool, {
+      ...opts,
+      authorizer: authRuleForRepo(repoId, this._authConfig),
+    });
     this._repositories.set(repoId, repo);
     const file = await JSONLogFileOpen(
       path.join(this.path, relativePathForRepo(repoId)),
@@ -312,6 +548,7 @@ export class GoatDB {
     repo.mute();
     this.queryPersistence?.get(repoId);
     const cursor = await JSONLogFileStartCursor(file);
+    let loadedFromBackup = false;
     let done = false;
     let nextPromise = JSONLogFileScan(cursor);
     do {
@@ -319,7 +556,10 @@ export class GoatDB {
       [entries, done] = await nextPromise;
       nextPromise = JSONLogFileScan(cursor);
       // [entries, done] = await JSONLogFileScan(cursor);
-      const commits = Commit.fromJSArr(this.orgId, entries);
+      const commits = Commit.fromJSArr(this.orgId, entries, this.schemaManager);
+      if (commits.length > 0) {
+        loadedFromBackup = true;
+      }
       // for (const c of commits) {
       //   commitIds.add(c.id);
       // }
@@ -347,26 +587,101 @@ export class GoatDB {
           this.orgId,
         );
         clients.push(c);
+        if (!loadedFromBackup) {
+          await c.sync();
+        }
         c.ready = true;
         c.startSyncing();
       }
-      this._peers!.set(repoId, clients);
+      this._repoClients!.set(repoId, clients);
     }
     return repo;
-  }
-
-  getRepository(id: string): Repository | undefined {
-    return this._repositories.get(Repository.normalizeId(id));
-  }
-
-  flush(path: string): Promise<void> {
-    path = itemPathNormalize(path);
-    const fileEntry = this._files.get(itemPathGetRepoId(path));
-    return fileEntry ? JSONLogFileFlush(fileEntry) : Promise.resolve();
   }
 }
 
 function relativePathForRepo(repoId: string): string {
-  const [storage, id] = Repository.parseId(Repository.normalizeId(repoId));
+  const [storage, id] = Repository.parseId(Repository.normalizePath(repoId));
   return path.join(storage, id + '.jsonl');
+}
+
+const kBuiltinAuthRules: AuthConfig = [
+  {
+    path: '/sys/users',
+    rule: (_db, _repoPath, itemKey, session, op) => {
+      if (session.owner === 'root') {
+        return true;
+      }
+      if (session.owner === itemKey) {
+        return true;
+      }
+      return op === 'read';
+    },
+  },
+  {
+    path: '/sys/sessions',
+    rule: (_db, _repoPath, _itemKey, session, op) => {
+      if (session.owner === 'root') {
+        return true;
+      }
+      return op === 'read';
+    },
+  },
+  // Reserving /sys/* for the system's use
+  {
+    path: /[/]sys[/]\S*/g,
+    rule: (_db, _repoPath, _itemKey, session, _op) => {
+      return session.owner === 'root';
+    },
+  },
+] as const;
+
+function authRuleForRepo(
+  repoPath: string,
+  config: AuthConfig,
+): AuthRule | undefined {
+  const id = Repository.normalizePath(repoPath);
+  // Builtin rules override user-provided ones
+  for (const { path, rule } of kBuiltinAuthRules) {
+    if (path === id) {
+      return rule;
+    }
+  }
+  // Look for a user-provided rule
+  for (const { path, rule } of config) {
+    if (typeof path === 'string') {
+      if (Repository.normalizePath(path) === id) {
+        return rule;
+      }
+    } else {
+      path.lastIndex = 0;
+      if (path.test(repoPath)) {
+        return rule;
+      }
+    }
+  }
+}
+
+function pickInstanceNumber(
+  startIndex: number = 0,
+): Promise<number | undefined> {
+  if (FileImplGet() === FileImplOPFS) {
+    const { promise: indefinitePromise } = Promise.withResolvers();
+    const { promise, resolve } = Promise.withResolvers<number | undefined>();
+    navigator.locks.request(
+      'GoatDB-' + startIndex,
+      { ifAvailable: true },
+      async (lockOrNull) => {
+        if (lockOrNull === null) {
+          resolve(await pickInstanceNumber(startIndex + 1));
+        }
+        if (lockOrNull !== null) {
+          resolve(startIndex);
+          return indefinitePromise;
+        }
+      },
+    );
+    return promise;
+  } else {
+    return Promise.resolve(undefined);
+  }
 }

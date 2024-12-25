@@ -1,40 +1,6 @@
-import { SchemeManager } from '../../cfds/base/scheme.ts';
+import { SchemaManager } from '../../cfds/base/schema.ts';
 
-// export const kSchemeUser = {
-//   ns: 'user',
-//   version: 1,
-//   fields: {
-//     name: {
-//       type: 'string',
-//       default: () => 'Anonymous',
-//     },
-//     chats: {
-//       type: 'set',
-//       default: () => new Set<string>(),
-//     },
-//   },
-// } as const;
-// type SchemeUserType = typeof kSchemeUser;
-// SchemeManager.default.register(kSchemeUser);
-
-// export const kSchemeMessage = {
-//   ns: 'message',
-//   version: 1,
-//   fields: {
-//     sender: {
-//       type: 'string',
-//       required: true,
-//     },
-//     value: {
-//       type: 'string',
-//       required: true,
-//     },
-//   },
-// } as const;
-// type SchemeMessageType = typeof kSchemeMessage;
-// SchemeManager.default.register(kSchemeMessage);
-
-export const kSchemeTask = {
+export const kSchemaTask = {
   ns: 'task',
   version: 1,
   fields: {
@@ -44,5 +10,8 @@ export const kSchemeTask = {
     },
   },
 } as const;
-type SchemeTaskType = typeof kSchemeTask;
-SchemeManager.default.register(kSchemeTask);
+export type SchemeTypeTask = typeof kSchemaTask;
+
+export default function setup(): void {
+  SchemaManager.default.register(kSchemaTask);
+}

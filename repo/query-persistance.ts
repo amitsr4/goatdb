@@ -3,7 +3,7 @@ import { Query } from './query.ts';
 import { Repository, RepoStorage, MemRepoStorage } from './repo.ts';
 import { SimpleTimer, Timer } from '../base/timer.ts';
 import { kSecondMs } from '../base/date.ts';
-import { Scheme } from '../cfds/base/scheme.ts';
+import { Schema } from '../cfds/base/schema.ts';
 
 const QUERY_CACHE_VERSION = 1;
 
@@ -31,10 +31,10 @@ export interface QueryPersistanceStorage {
 export class QueryPersistence {
   private readonly _queries: Map<
     string,
-    Set<Query<Scheme, Scheme, ReadonlyJSONValue>>
+    Set<Query<Schema, Schema, ReadonlyJSONValue>>
   >;
   private readonly _persistedGeneration: Map<
-    Query<Scheme, Scheme, ReadonlyJSONValue>,
+    Query<Schema, Schema, ReadonlyJSONValue>,
     number
   >;
   private readonly _cachedDataForRepo: Map<string, Map<string, QueryCache>>;
@@ -67,29 +67,29 @@ export class QueryPersistence {
     this._flushTimer.unschedule();
   }
 
-  register(query: Query<Scheme, Scheme, ReadonlyJSONValue>): void {
-    let set = this._queries.get(query.repo.id);
+  register(query: Query<Schema, Schema, ReadonlyJSONValue>): void {
+    let set = this._queries.get(query.repo.path);
     if (!set) {
       set = new Set();
-      this._queries.set(query.repo.id, set);
+      this._queries.set(query.repo.path, set);
     }
     set.add(query);
-    this.flush(query.repo.id);
+    this.flush(query.repo.path);
   }
 
-  unregister(query: Query<Scheme, Scheme, ReadonlyJSONValue>): void {
-    const set = this._queries.get(query.repo.id);
+  unregister(query: Query<Schema, Schema, ReadonlyJSONValue>): void {
+    const set = this._queries.get(query.repo.path);
     if (set) {
       set.delete(query);
       if (set.size === 0) {
-        this._queries.delete(query.repo.id);
+        this._queries.delete(query.repo.path);
         this._persistedGeneration.delete(query);
       }
     }
   }
 
   async get(repoId: string, queryId?: string): Promise<QueryCache | undefined> {
-    repoId = Repository.normalizeId(repoId);
+    repoId = Repository.normalizePath(repoId);
     let map = this._cachedDataForRepo.get(repoId);
     if (!map) {
       map = await this.loadCacheForRepo(repoId);
@@ -116,7 +116,7 @@ export class QueryPersistence {
   private async _loadCacheForRepoImpl(
     repoId: string,
   ): Promise<Map<string, QueryCache>> {
-    repoId = Repository.normalizeId(repoId);
+    repoId = Repository.normalizePath(repoId);
     const json = await this.storage?.load(repoId);
     if (json?.version !== QUERY_CACHE_VERSION) {
       return new Map();
@@ -135,7 +135,7 @@ export class QueryPersistence {
   }
 
   flush(repoId: string): Promise<void> {
-    repoId = Repository.normalizeId(repoId);
+    repoId = Repository.normalizePath(repoId);
     let promise = this._flushPromises.get(repoId);
     if (!promise) {
       promise = this._flushImpl(repoId);
@@ -148,7 +148,7 @@ export class QueryPersistence {
     if (!this.storage) {
       return;
     }
-    repoId = Repository.normalizeId(repoId);
+    repoId = Repository.normalizePath(repoId);
     let changed = false;
     const queries = this._queries.get(repoId) || [];
     for (const q of queries) {
