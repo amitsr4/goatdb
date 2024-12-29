@@ -42,6 +42,7 @@ import {
   coreValueEquals,
 } from '../../base/core-types/index.ts';
 import { SchemaGetFieldDef } from './schema.ts';
+import { Readwrite } from '../../base/types.ts';
 
 export interface ReadonlyItem<S extends Schema> {
   readonly isNull: boolean;
@@ -218,10 +219,14 @@ export class Item<S extends Schema = Schema>
   get<T extends keyof SchemaDataType<S>>(
     key: string & T,
   ): SchemaDataType<S>[T] {
+    const fieldDef = SchemaGetFieldDef(this.schema, key);
     assert(
-      SchemaGetFieldDef(this.schema, key) !== undefined,
+      fieldDef !== undefined,
       `Unknown field name '${key}' for schema '${this.schema.ns}'`,
     );
+    if (!Object.hasOwn(this._data, key) && fieldDef.default !== undefined) {
+      return fieldDef.default(this._data);
+    }
     return this._data[key] as SchemaDataType<S>[T];
   }
 
@@ -336,7 +341,9 @@ export class Item<S extends Schema = Schema>
     return result;
   }
 
-  cloneData(onlyFields?: (keyof SchemaDataType<S>)[]): SchemaDataType<S> {
+  cloneData(
+    onlyFields?: (keyof SchemaDataType<S>)[],
+  ): Readwrite<SchemaDataType<S>> {
     return clone(this._schema, this._data, onlyFields);
   }
 

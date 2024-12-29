@@ -1,5 +1,5 @@
 import * as path from 'std/path/mod.ts';
-import { Session, TrustPool } from './session.ts';
+import { Session, sessionFromItem, TrustPool } from './session.ts';
 import { Repository, RepositoryConfig } from '../repo/repo.ts';
 import { DBSettings, DBSettingsProvider } from './settings/settings.ts';
 import { FileSettings } from './settings/file.ts';
@@ -10,15 +10,20 @@ import { SyncScheduler } from '../net/sync-scheduler.ts';
 import { QueryPersistence } from '../repo/query-persistance.ts';
 import { QueryPersistenceFile } from './persistance/query-file.ts';
 import { ManagedItem } from './managed-item.ts';
-import { Schema, SchemaManager } from '../cfds/base/schema.ts';
+import {
+  Schema,
+  SchemaManager,
+  SchemaTypeSession,
+} from '../cfds/base/schema.ts';
 import {
   itemPath,
   itemPathGetPart,
   itemPathGetRepoId,
+  itemPathJoin,
   itemPathNormalize,
   ItemPathPart,
 } from './path.ts';
-import { isBrowser, uniqueId } from '../base/common.ts';
+import { isBrowser, mapIterable, uniqueId } from '../base/common.ts';
 import { SchemaDataType } from '../cfds/base/schema.ts';
 import { Item } from '../cfds/base/item.ts';
 import {
@@ -33,12 +38,13 @@ import {
 } from '../base/json-log/json-log.ts';
 import { ReadonlyJSONObject, ReadonlyJSONValue } from '../base/interfaces.ts';
 import { BloomFilter } from '../cpp/bloom_filter.ts';
-import { QueryConfig, Query } from '../repo/query.ts';
+import { QueryConfig, Query, generateQueryId } from '../repo/query.ts';
 import { md51 } from '../external/md5.ts';
 import { sendLoginEmail } from '../net/rest-api.ts';
 import { normalizeEmail } from '../base/string.ts';
 import { FileImplGet } from '../base/json-log/file-impl.ts';
 import { FileImplOPFS } from '../base/json-log/file-impl-opfs.ts';
+import { assert } from '../base/error.ts';
 
 /**
  * Denotes the type of the requested operation.
@@ -283,6 +289,9 @@ export class GoatDB {
    * @returns         A managed item that tracks both local and remote edits.
    */
   item<S extends Schema>(...pathComps: string[]): ManagedItem<S> {
+    for (const s of pathComps) {
+      assert(typeof s === 'string'); // Sanity check
+    }
     const path = itemPathNormalize(pathComps.join('/'));
     let item = this._items.get(path);
     if (!item) {
@@ -308,15 +317,12 @@ export class GoatDB {
     schema: S,
     data: Partial<SchemaDataType<S>>,
   ): ManagedItem<S> {
-    const path = itemPath(...Repository.parseId(repoPath), uniqueId());
-    let item = this._items.get(path);
-    if (!item) {
-      item = new ManagedItem(this, path);
-      this._items.set(path, item);
+    const item = this.item<S>(...Repository.parseId(repoPath), uniqueId());
+    if (item.schema.ns === null) {
       item.schema = schema;
       item.setMulti(data);
     }
-    return item as unknown as ManagedItem<S>;
+    return item;
   }
 
   /**
@@ -337,7 +343,7 @@ export class GoatDB {
     data: SchemaDataType<S>,
   ): Promise<void> {
     const repo = await this.open(path);
-    let key = itemPathGetPart(path, ItemPathPart.Item);
+    let key = itemPathGetPart(path, 'item');
     if (key.length <= 0) {
       key = uniqueId();
     }
@@ -396,10 +402,11 @@ export class GoatDB {
   ): Query<IS, OS, CTX> {
     let id = config.id;
     if (!id) {
-      id = md51(
-        (config.predicate !== undefined
-          ? config.predicate.toString()
-          : 'undefined') + config.sortDescriptor?.toString(),
+      id = generateQueryId(
+        config.predicate,
+        config.sortDescriptor,
+        config.ctx,
+        config.schema?.ns,
       );
     }
     let q = this._openQueries.get(id);
@@ -435,6 +442,16 @@ export class GoatDB {
   }
 
   /**
+   * Flushes all pending writes for all repositories to disk.
+   */
+  async flushAll(): Promise<void> {
+    const promises = mapIterable(this._repositories.keys(), (path) =>
+      this.flush(path),
+    );
+    await Promise.allSettled(promises);
+  }
+
+  /**
    * Returns the requested repository or undefined if it wasn't opened yet.
    *
    * Note: Prefer to use the higher level APIs of this class rather than the
@@ -467,7 +484,14 @@ export class GoatDB {
     await this._createTrustPool();
     // Open /sys/sessions so all known sessions are properly loaded into our
     // new trust pool
-    await this.open('/sys/sessions');
+    const sessionsRepo = await this.open('/sys/sessions');
+    // Although the repository automatically adds new sessions to the trust
+    // pool, the initial bootstrapping must happen explicitly as the chain of
+    // sessions won't be loaded in the correct order.
+    for (const key of sessionsRepo.keys()) {
+      const s = sessionsRepo.valueForKey<SchemaTypeSession>(key)![0];
+      this._trustPool?.addSessionUnsafe(await sessionFromItem(s));
+    }
     // Open /sys/users so we can perform login and basic operations without
     // waiting
     await this.open('/sys/users');
@@ -482,7 +506,6 @@ export class GoatDB {
 
   private async _createTrustPool(): Promise<void> {
     const fileIndex = await pickInstanceNumber();
-    debugger;
     this._path = fileIndex
       ? path.join(
           path.dirname(this._basePath),
@@ -576,6 +599,11 @@ export class GoatDB {
       // commitIds.add(c.id);
       // }
     });
+    repo.attach('NewCommit', async (c: Commit) => {
+      await repo.mergeIfNeeded(c.key);
+      const item = this._items.get(itemPathJoin(repo.path, c.key));
+      item?.rebase();
+    });
     if (this._syncSchedulers) {
       const clients: RepoClient[] = [];
       for (const scheduler of this._syncSchedulers) {
@@ -588,10 +616,14 @@ export class GoatDB {
         );
         clients.push(c);
         if (!loadedFromBackup) {
-          await c.sync();
+          c.sync().then(() => {
+            c.ready = true;
+            c.startSyncing();
+          });
+        } else {
+          c.ready = true;
+          c.startSyncing();
         }
-        c.ready = true;
-        c.startSyncing();
       }
       this._repoClients!.set(repoId, clients);
     }
@@ -661,18 +693,25 @@ function authRuleForRepo(
   }
 }
 
+let gSelectedInstanceNumber = -1;
+
 function pickInstanceNumber(
   startIndex: number = 0,
 ): Promise<number | undefined> {
   if (FileImplGet() === FileImplOPFS) {
     const { promise: indefinitePromise } = Promise.withResolvers();
     const { promise, resolve } = Promise.withResolvers<number | undefined>();
+    if (gSelectedInstanceNumber >= 0) {
+      resolve(gSelectedInstanceNumber);
+    }
     navigator.locks.request(
       'GoatDB-' + startIndex,
       { ifAvailable: true },
       async (lockOrNull) => {
         if (lockOrNull === null) {
-          resolve(await pickInstanceNumber(startIndex + 1));
+          const idx = (await pickInstanceNumber(startIndex + 1))!;
+          gSelectedInstanceNumber = idx;
+          resolve(idx);
         }
         if (lockOrNull !== null) {
           resolve(startIndex);

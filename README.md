@@ -19,7 +19,21 @@ GoatDB also guarantees causal consistency, meaning changes are shared in the cor
 • [Queries](docs/query.md)
 • [Schemas](docs/schema.md)
 
-Detailed setup instructions are coming soon. Follow the Issues tab to track progress toward v0.1.
+Check out [web-app/src/app.tsx](web-app/src/app.tsx) to get an idea of what it's like to build apps using GoatDB.
+
+### Running the Demo
+
+_**Caveats:**_ Currently the demo runs only on Mac and Linux. Windows support is in the works.
+
+1. Install [Deno](https://docs.deno.com/runtime/getting_started/installation/) 1.46.3 - See [this issue](#2).
+2. Checkout this repository.
+3. `cd` into the checked out repo.
+4. Run `npm install`. This is a temporary hack that'll soon be removed.
+5. Run `deno run -A server/debug-server.ts -d /path/to/data/dir`
+
+An interactive debug server will then start on http://localhost:8080
+
+Follow the Issues tab to track progress toward v0.1.
 
 ## Why GoatDB?
 
