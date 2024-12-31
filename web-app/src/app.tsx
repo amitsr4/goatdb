@@ -20,8 +20,7 @@ export function Header() {
           db.create('/data/tasks', kSchemaTask, {
             text: ref.current!.value,
           });
-        }}
-      >
+        }}>
         Add
       </button>
     </div>
@@ -51,8 +50,7 @@ export function TaskItem({ path }: TaskItemProps) {
       <button
         onClick={() => {
           task.isDeleted = true;
-        }}
-      >
+        }}>
         Delete
       </button>
     </div>

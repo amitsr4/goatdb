@@ -130,7 +130,7 @@ async function populateDB(db: GoatDB): Promise<void> {
 }
 
 const REPO_FILE_PATH =
-  '/Users/amit-steiner/Documents/Amit/goatDB/test/notes.jsonl';
+  '/Users/amit-steiner/Documents/Amit/goatDB/test/notes1M.jsonl';
 
 const DB_PATH = '/Users/amit-steiner/Documents/Amit/goatDB/';
 
@@ -223,7 +223,7 @@ export async function testsMain(): Promise<void> {
   console.log(`Starting query...`);
   const queryStart = performance.now();
   let prevCount: number | undefined;
-  const queryIter = 1;
+  const queryIter = 10;
   for (let i = 0; i < queryIter; ++i) {
     const query = db.query({
       source: repoPath,

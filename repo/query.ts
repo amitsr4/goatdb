@@ -17,7 +17,7 @@ const BLOOM_FPR = 0.01;
 
 export type Entry<S extends Schema = Schema> = [
   path: string | null,
-  item: Item<S>,
+  item: Item<S>
 ];
 export type PredicateInfo<S extends Schema, CTX> = {
   path: string;
@@ -25,7 +25,7 @@ export type PredicateInfo<S extends Schema, CTX> = {
   ctx: CTX;
 };
 export type Predicate<S extends Schema, CTX extends ReadonlyJSONValue> = (
-  info: PredicateInfo<S, CTX>,
+  info: PredicateInfo<S, CTX>
 ) => boolean;
 
 export type SortInfo<S extends Schema, CTX> = {
@@ -34,7 +34,7 @@ export type SortInfo<S extends Schema, CTX> = {
   ctx: CTX;
 };
 export type SortDescriptor<S extends Schema, CTX> = (
-  info: SortInfo<S, CTX>,
+  info: SortInfo<S, CTX>
 ) => number;
 export type QuerySource<IS extends Schema = Schema, OS extends IS = IS> =
   | Repository
@@ -44,7 +44,7 @@ export type QuerySource<IS extends Schema = Schema, OS extends IS = IS> =
 export type QueryConfig<
   IS extends Schema,
   OS extends IS,
-  CTX extends ReadonlyJSONValue,
+  CTX extends ReadonlyJSONValue
 > = {
   db: GoatDB;
   source: QuerySource<IS, OS>;
@@ -61,7 +61,7 @@ export type QueryEvent = EventDocumentChanged | 'LoadingFinished' | 'Closed';
 export class Query<
   IS extends Schema,
   OS extends IS,
-  CTX extends ReadonlyJSONValue,
+  CTX extends ReadonlyJSONValue
 > extends Emitter<QueryEvent> {
   readonly id: string;
   readonly db: GoatDB;
@@ -94,7 +94,7 @@ export class Query<
   //   OS extends IS = IS,
   //   ST extends RepoStorage<ST> = MemRepoStorage,
   // >(config: QueryConfig<IS, OS, ST>): Query<IS, OS, ST> {
-  //   let id = config.id;
+  //   let id = config.id
   //   if (!id) {
   //     id = md51(
   //       config.predicate.toString() + config.sortDescriptor?.toString(),
@@ -260,7 +260,7 @@ export class Query<
             ? this.repo
             : this.source) as Emitter<EventDocumentChanged>
         ).attach('DocumentChanged', (key: string) =>
-          this.onNewCommit(this.repo.headForKey(key)!),
+          this.onNewCommit(this.repo.headForKey(key)!)
         );
       }
     }
@@ -270,7 +270,7 @@ export class Query<
     if (!this._closed) {
       this.emit('Closed');
       this.repo.db.queryPersistence?.unregister(
-        this as unknown as Query<Schema, Schema, ReadonlyJSONValue>,
+        this as unknown as Query<Schema, Schema, ReadonlyJSONValue>
       );
       if (this._sourceListenerCleanup) {
         this._sourceListenerCleanup();
@@ -285,7 +285,7 @@ export class Query<
   protected suspend(): void {
     if (!this._closed) {
       this.repo.db.queryPersistence?.unregister(
-        this as unknown as Query<Schema, Schema, ReadonlyJSONValue>,
+        this as unknown as Query<Schema, Schema, ReadonlyJSONValue>
       );
       this._sourceListenerCleanup!();
       this._sourceListenerCleanup = undefined;
@@ -316,7 +316,7 @@ export class Query<
     path: string,
     prevDoc: Item<IS> | undefined,
     currentDoc: Item<IS>,
-    head?: Commit,
+    head?: Commit
   ): void {
     this._age = Math.max(this._age, head?.age || 0);
     if (!prevDoc?.isEqual(currentDoc)) {
@@ -371,7 +371,7 @@ export class Query<
         itemPathJoin(repo.path, key),
         prevDoc as unknown as Item<IS>,
         currentDoc as unknown as Item<IS>,
-        currentHead,
+        currentHead
       );
     }
   }
@@ -425,7 +425,7 @@ export class Query<
             cancelCallback = () => cancelPromise.cancel();
           }
           processPath(path, cancelCallback);
-        },
+        }
       );
     } else {
       let stopProcessing = false;
@@ -445,7 +445,7 @@ export class Query<
       if (!this._loadingFinished) {
         this._loadingFinished = true;
         this.repo.db.queryPersistence?.register(
-          this as unknown as Query<Schema, Schema, ReadonlyJSONValue>,
+          this as unknown as Query<Schema, Schema, ReadonlyJSONValue>
         );
         await this.repo.db.queryPersistence?.flush(this.id);
         this._loading = false;
@@ -483,12 +483,12 @@ const gGeneratedQueryIds = new Map<string, string>();
 export function generateQueryId<
   IS extends Schema = Schema,
   OS extends IS = IS,
-  CTX extends ReadonlyJSONValue = ReadonlyJSONValue,
+  CTX extends ReadonlyJSONValue = ReadonlyJSONValue
 >(
   predicate: Predicate<IS, CTX> | undefined,
   sortDescriptor: SortDescriptor<OS, CTX> | undefined,
   ctx: CTX | undefined,
-  ns: string | null | undefined,
+  ns: string | null | undefined
 ): string {
   const baseId =
     predicate !== undefined && sortDescriptor !== undefined

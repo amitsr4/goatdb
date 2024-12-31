@@ -1,0 +1,31 @@
+{
+  "session": {
+    "id": "glthfdivz6h05kq61ruw789o",
+    "publicKey": {
+      "kty": "EC",
+      "crv": "P-384",
+      "alg": "ES384",
+      "x": "wNweoe0-GAqfzGIR6MDrhTm7gr99cZnTlpBPMiqOnHXAIE080VC9OdsG9YG7OJEB",
+      "y": "7e25aHNfu9y4kvPEXigdK-WKO3Ji9Ctd_BR4r9hjdblbDwki90bZvVDLT0yg3qPi",
+      "key_ops": [
+        "verify"
+      ],
+      "ext": true
+    },
+    "privateKey": {
+      "kty": "EC",
+      "crv": "P-384",
+      "alg": "ES384",
+      "x": "wNweoe0-GAqfzGIR6MDrhTm7gr99cZnTlpBPMiqOnHXAIE080VC9OdsG9YG7OJEB",
+      "y": "7e25aHNfu9y4kvPEXigdK-WKO3Ji9Ctd_BR4r9hjdblbDwki90bZvVDLT0yg3qPi",
+      "d": "8efTKFEKnGnJNX_xt_5YusDfB9V9KINTLU72WbzaGv7h5YCCqfxaJlGTNlA4QAdR",
+      "key_ops": [
+        "sign"
+      ],
+      "ext": true
+    },
+    "owner": "root",
+    "expiration": 1738071709.955
+  },
+  "operatorEmails": []
+}
